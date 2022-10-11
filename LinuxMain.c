@@ -1,3 +1,6 @@
+// Remove this line for non-OpenGL build (better performance on Raspberry Pi)
+#define OPENGL
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -5,8 +8,7 @@
 #include <time.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
-#include <GL/gl.h>
-#include <GL/glx.h>
+#include <X11/Xutil.h>
 #include <pulse/pulseaudio.h>
 #include <pthread.h>
 #include <dirent.h>
@@ -15,6 +17,11 @@
 #include <sys/resource.h>
 #include <sys/sysinfo.h>
 #include <linux/input.h>
+
+#ifdef OPENGL
+#include <GL/gl.h>
+#include <GL/glx.h>
+#endif
 
 #include "CommonMain.h"
 #include "Platform.h"
@@ -28,16 +35,29 @@
 #include "NewGameAreYouSure.h"
 #include "GamepadUnplugged.h"
 
+#define INITIAL_WINDOW_WIDTH 640
+#define INITIAL_WINDOW_HEIGHT 480
+
 #define BITS_TO_LONGS(x) \
         (((x) + 8 * sizeof (unsigned long) - 1) / (8 * sizeof (unsigned long)))
 
 typedef void *(*thread_start_ptr_t)(void *);
+
+#ifdef OPENGL
 typedef void (*swap_interval_ptr_t)(Display *, GLXDrawable, int);
+#endif
 
 typedef struct X11Window
 {
     Display *display;
     Window window;
+    #ifndef OPENGL
+    XImage *ximage;
+    GC gc;
+    uint32_t *framebuffer;
+    Visual *visual;
+    unsigned int depth;
+    #endif
 } X11Window;
 
 static unsigned long test_bit(unsigned long bit, unsigned long *bitfield)
@@ -117,44 +137,54 @@ void *asset_loading_proc(void *arg)
     return NULL;
 }
 
-static void RenderFrameGraphics(void)
+static void WindowResize(int width, int height, X11Window *x11)
 {
-    switch(gCurrentGameState) {
-        case GAMESTATE_OPENINGSPLASHSCREEN:
-            DrawOpeningSplashScreen();
-            break;
-        case GAMESTATE_GAMEPADUNPLUGGED:
-            DrawGamepadUnplugged();
-            break;
-        case GAMESTATE_TITLESCREEN:
-            DrawTitleScreen();
-            break;
-        case GAMESTATE_CHARACTERNAMING:
-            DrawCharacterNaming();
-            break;
-        case GAMESTATE_OVERWORLD:
-            DrawOverworld();
-            break;
-        case GAMESTATE_BATTLE:
-            DrawBattle();
-            break;
-        case GAMESTATE_EXITYESNOSCREEN:
-            DrawExitYesNoScreen();
-            break;
-        case GAMESTATE_OPTIONSSCREEN:
-            DrawOptionsScreen();
-            break;
-        case GAMESTATE_NEWGAMEAREYOUSURE:
-            DrawNewGameAreYouSure();
-            break;
-        default:
-            ASSERT(false, "Gamestate not implemented!");
+    // Somtimes repeat events come in from X11 (ex. from some other structure member changing we don't care about).
+    // If monitor width and height haven't changed, there's nothing to do.
+    if (width == gPerformanceData.MonitorWidth && height == gPerformanceData.MonitorHeight) {
+        return;
     }
 
-    if (gPerformanceData.DisplayDebugInfo) {
-        DrawDebugInfo();
+    // Clamp these so if the window is too small, we still have a large enough framebuffer to draw the game without crashing.
+    if (width < GAME_RES_WIDTH) {
+        width = GAME_RES_WIDTH;
+    }
+    if (height < GAME_RES_HEIGHT) {
+        height = GAME_RES_HEIGHT;
     }
 
+    #ifndef OPENGL
+    // XDestroyImage will free the framebuffer even though XCreateImage does not allocate it.
+    if (x11->ximage != NULL) {
+        XDestroyImage(x11->ximage);
+    }
+    x11->framebuffer = malloc(width * height * 4);
+    if (x11->framebuffer == NULL) {
+        LogMessageA(LL_ERROR, "[%s] malloc failed", __FUNCTION__);
+        exit(1);
+    }
+    x11->ximage = XCreateImage(x11->display, x11->visual, x11->depth, ZPixmap, 0, (char *)x11->framebuffer, width, height, 32, 0);
+    #endif
+
+    LoadSettings();
+    for (uint8_t i = 1; i < 12; i++) {
+        if (GAME_RES_WIDTH * i > width || GAME_RES_HEIGHT * i > height) {
+            gPerformanceData.MaxScaleFactor = i - 1;
+            break;
+        }
+    }
+
+    if (gPerformanceData.CurrentScaleFactor == 0 || gPerformanceData.CurrentScaleFactor > gPerformanceData.MaxScaleFactor) {
+        gPerformanceData.CurrentScaleFactor = gPerformanceData.MaxScaleFactor;
+    }
+
+    gPerformanceData.MonitorWidth = width;
+    gPerformanceData.MonitorHeight = height;
+}
+
+#ifdef OPENGL
+static void BlitToScreen(X11Window x11)
+{
     glClear(GL_COLOR_BUFFER_BIT);
 
     glViewport(
@@ -209,6 +239,78 @@ static void RenderFrameGraphics(void)
     glVertex2i(-1, 1);
 
     glEnd();
+
+    glXSwapBuffers(x11.display, x11.window);
+}
+
+#else
+static void BlitToScreen(X11Window x11)
+{
+    uint8_t scale = gPerformanceData.CurrentScaleFactor;
+    size_t start_x = (gPerformanceData.MonitorWidth / 2) - ((GAME_RES_WIDTH * scale) / 2);
+    size_t start_y = (gPerformanceData.MonitorHeight / 2) - ((GAME_RES_HEIGHT * scale) / 2);
+
+    uint32_t *src = (uint32_t *)gBackBuffer.Memory + (GAME_RES_WIDTH * GAME_RES_HEIGHT) - GAME_RES_WIDTH;
+    uint32_t *dst = x11.framebuffer + start_x + (start_y * gPerformanceData.MonitorWidth);
+    size_t skip = gPerformanceData.MonitorWidth - (GAME_RES_WIDTH * scale);
+    memset(x11.framebuffer, 0, gPerformanceData.MonitorWidth * gPerformanceData.MonitorHeight * 4);
+    for (int x = 0; x < GAME_RES_HEIGHT; x++) {
+        for (uint8_t sx = 0; sx < scale; sx++) {
+            for (int y = 0; y < GAME_RES_WIDTH; y++) {
+                for (uint8_t sy = 0; sy < scale; sy++) {
+                    *dst++ = *src;
+                }
+                src++;
+            }
+            dst += skip;
+            src -= GAME_RES_WIDTH;
+        }
+        src -= GAME_RES_WIDTH;
+    }
+    XPutImage(x11.display, x11.window, x11.gc, x11.ximage, 0, 0, 0, 0, gPerformanceData.MonitorWidth, gPerformanceData.MonitorHeight);
+}
+
+#endif
+
+static void RenderFrameGraphics(X11Window x11)
+{
+    switch(gCurrentGameState) {
+        case GAMESTATE_OPENINGSPLASHSCREEN:
+            DrawOpeningSplashScreen();
+            break;
+        case GAMESTATE_GAMEPADUNPLUGGED:
+            DrawGamepadUnplugged();
+            break;
+        case GAMESTATE_TITLESCREEN:
+            DrawTitleScreen();
+            break;
+        case GAMESTATE_CHARACTERNAMING:
+            DrawCharacterNaming();
+            break;
+        case GAMESTATE_OVERWORLD:
+            DrawOverworld();
+            break;
+        case GAMESTATE_BATTLE:
+            DrawBattle();
+            break;
+        case GAMESTATE_EXITYESNOSCREEN:
+            DrawExitYesNoScreen();
+            break;
+        case GAMESTATE_OPTIONSSCREEN:
+            DrawOptionsScreen();
+            break;
+        case GAMESTATE_NEWGAMEAREYOUSURE:
+            DrawNewGameAreYouSure();
+            break;
+        default:
+            ASSERT(false, "Gamestate not implemented!");
+    }
+
+    if (gPerformanceData.DisplayDebugInfo) {
+        DrawDebugInfo();
+    }
+
+    BlitToScreen(x11);
 }
 
 void pulse_context_state_callback(pa_context *context, void *pulse_loop)
@@ -370,70 +472,64 @@ static pa_threaded_mainloop *init_pulse_audio(void)
 
 static X11Window init_x11(void)
 {
-    Display *display = XOpenDisplay(NULL);
-    if (display == NULL) {
+    X11Window x11 = { 0 };
+    x11.display = XOpenDisplay(NULL);
+    if (x11.display == NULL) {
         LogMessageA(LL_ERROR, "[%s] XOpenDisplay failed", __FUNCTION__);
         exit(1);
     }
-    Window window = XCreateSimpleWindow(
-        display, DefaultRootWindow(display),
-        0, 0, 640, 480, 0, 0, 0
+    x11.window = XCreateSimpleWindow(
+        x11.display, DefaultRootWindow(x11.display),
+        0, 0, INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, 0, 0, 0
     );
 
     // This is needed to prevent flickering on window resize.
-    XSetWindowBackgroundPixmap(display, window, None);
+    XSetWindowBackgroundPixmap(x11.display, x11.window, None);
 
     // Set window title with the game name.
-    XStoreName(display, window, GAME_NAME);
+    XStoreName(x11.display, x11.window, GAME_NAME);
 
     // Create the event for window close.
-    Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", True);
-    XSetWMProtocols(display, window, &wm_delete, 1);
+    Atom wm_delete = XInternAtom(x11.display, "WM_DELETE_WINDOW", True);
+    XSetWMProtocols(x11.display, x11.window, &wm_delete, 1);
+
+    // Receive notifcations about window resize.
+    XSelectInput(x11.display, x11.window, StructureNotifyMask);
 
     // Fullscreen
-    Atom wm_state = XInternAtom(display, "_NET_WM_STATE", True);
-    Atom wm_fullscreen = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", True);
-    XChangeProperty(display, window, wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)&wm_fullscreen, 1);
+    Atom wm_state = XInternAtom(x11.display, "_NET_WM_STATE", True);
+    Atom wm_fullscreen = XInternAtom(x11.display, "_NET_WM_STATE_FULLSCREEN", True);
+    XChangeProperty(x11.display, x11.window, wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)&wm_fullscreen, 1);
 
-    XMapWindow(display, window);
+    XMapWindow(x11.display, x11.window);
+
+    #ifdef OPENGL
+
     int glxAttributes[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
-    XVisualInfo *visual = glXChooseVisual(display, 0, glxAttributes);
-    GLXContext context = glXCreateContext(display, visual, NULL, GL_TRUE);
-    glXMakeCurrent(display, window, context);
+    XVisualInfo *glxVisual = glXChooseVisual(x11.display, 0, glxAttributes);
+    GLXContext context = glXCreateContext(x11.display, glxVisual, NULL, GL_TRUE);
+    glXMakeCurrent(x11.display, x11.window, context);
 
     // Enable VSync
     swap_interval_ptr_t swap_ptr = (swap_interval_ptr_t)glXGetProcAddress((const GLubyte *)"glXSwapIntervalEXT");
     if (swap_ptr) {
-        swap_ptr(display, window, 1);
+        swap_ptr(x11.display, x11.window, 1);
     }
 
-    Window root_window;
-    int x;
-    int y;
-    unsigned int width;
-    unsigned int height;
-    unsigned int border_width;
-    unsigned int depth;
+    #else
 
-    // Window will have re-sized to fullscreen by this point.  This returns the window width and height which should also be the monitor's resolution.
-    XGetGeometry(display, window, &root_window, &x, &y, &width, &height, &border_width, &depth);
+    int screen = DefaultScreen(x11.display);
+    x11.gc = DefaultGC(x11.display, screen);
+    x11.visual = DefaultVisual(x11.display, screen);
+    x11.depth = DefaultDepth(x11.display, screen);
 
-    for (uint8_t i = 1; i < 12; i++) {
-        if (GAME_RES_WIDTH * i > width || GAME_RES_HEIGHT * i > height) {
-            gPerformanceData.MaxScaleFactor = i - 1;
-            break;
-        }
-    }
+    #endif
 
-    if (gPerformanceData.CurrentScaleFactor == 0 || gPerformanceData.CurrentScaleFactor > gPerformanceData.MaxScaleFactor) {
-        gPerformanceData.CurrentScaleFactor = gPerformanceData.MaxScaleFactor;
-    }
-    gPerformanceData.MonitorWidth = width;
-    gPerformanceData.MonitorHeight = height;
+    // This sets up the scale factor using initial width/height.
+    // It will be called again later when we recive the event that we went fullscreen.
+    // On non-OpenGL path it also initializes the final framebuffer which needs to be sized equally to the window size.
+    WindowResize(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, &x11);
 
-    X11Window x11;
-    x11.display = display;
-    x11.window = window;
     return x11;
 }
 
@@ -650,13 +746,15 @@ int main(void)
         while (XPending(x11.display) > 0) {
             XEvent event;
             XNextEvent(x11.display, &event);
-            if (event.type == ClientMessage) {
-                return 0;
+            switch(event.type) {
+                case ClientMessage:
+                    return 0;
+                case ConfigureNotify:
+                    WindowResize(event.xconfigure.width, event.xconfigure.height, &x11);
             }
         }
         ProcessPlayerInput(x11);
-        RenderFrameGraphics();
-        glXSwapBuffers(x11.display, x11.window);
+        RenderFrameGraphics(x11);
         gPerformanceData.TotalFramesRendered++;
         struct timespec frame_end;
         clock_gettime(CLOCK_MONOTONIC, &frame_end);
